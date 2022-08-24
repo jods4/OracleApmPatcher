@@ -96,21 +96,24 @@ static void WrapWithActivity(string activityName, MethodDefinition method, Field
 
   // Prepend activity initialisation
   //   activity = activitySource
-  //      .StartActivity(activityName, ActivityKind.Internal)
-  //      ?.SetTag("cmd", this);
+  //      .CreateActivity(activityName, ActivityKind.Internal)
+  //      ?.SetTag("cmd", this)
+  //      .Start();
   var store = il.Create(OpCodes.Stloc, activity);
   il.Body.Instructions.Insert(0, il.Create(OpCodes.Ldsfld, activitySource));
   il.Body.Instructions.Insert(1, il.Create(OpCodes.Ldstr, activityName));
   il.Body.Instructions.Insert(2, il.Create(OpCodes.Ldc_I4_0)); // ActivityKind.Internal
   il.Body.Instructions.Insert(3, il.Create(OpCodes.Call,
-    mod.ImportReference(typeof(ActivitySource).GetMethod("StartActivity", new[] { typeof(string), typeof(ActivityKind) }))));
+    mod.ImportReference(typeof(ActivitySource).GetMethod("CreateActivity", new[] { typeof(string), typeof(ActivityKind) }))));
   il.Body.Instructions.Insert(4, il.Create(OpCodes.Dup));
   il.Body.Instructions.Insert(5, il.Create(OpCodes.Brfalse_S, store));
   il.Body.Instructions.Insert(6, il.Create(OpCodes.Ldstr, "cmd"));
   il.Body.Instructions.Insert(7, il.Create(OpCodes.Ldarg_0));
   il.Body.Instructions.Insert(8, il.Create(OpCodes.Call,
     mod.ImportReference(typeof(Activity).GetMethod("SetTag", new[] { typeof(string), typeof(object) }))));
-  il.Body.Instructions.Insert(9, store);
+  il.Body.Instructions.Insert(9, il.Create(OpCodes.Call,
+    mod.ImportReference(typeof(Activity).GetMethod("Start"))));
+  il.Body.Instructions.Insert(10, store);
 
   // Append fault block to handle errors
   // .fault
