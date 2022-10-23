@@ -1,5 +1,5 @@
 # OracleApmPatcher
-This tool uses Mono Cecil to instrument `Oracle.ManagedDataAccess.dll` with `ActvitiySource`.
+This tool uses Mono Cecil to instrument `Oracle.ManagedDataAccess.dll` with `ActivitySource`.
 
 ## Usage 
 Run `OraclePatcher Oracle.ManagedDataAccess.dll` on the command line.
@@ -25,7 +25,7 @@ Has a tag `cmd` with this `OracleCommand` instance, so you have access to `Comma
 If the call throws an exception, adds a tag `otel.status_code` with value `ERROR`.
 
 #### Activity `ExecuteNonQuery`
-Warps `ExecuteNonQuery` calls.
+Wraps `ExecuteNonQuery` calls.
 
 Has a tag `cmd` with this `OracleCommand` instance, so you have access to `CommandText`, `CommandType`, `Parameters`, etc.
 
