@@ -1,249 +1,376 @@
 ﻿using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Cecil.Rocks;
-using System.Diagnostics;
 
 if (args.Length != 1)
 {
-  Console.WriteLine("Usage: OraclePatcher.exe Oracle.ManagedDataAccess.dll");
-  return;
+    Console.WriteLine("Usage: OraclePatcher.exe Oracle.ManagedDataAccess.dll");
+    return;
 }
 
 var filename = args[0];
 
 Console.WriteLine("Patching " + filename);
-var module = ModuleDefinition.ReadModule(filename);
+var module = ModuleDefinition.ReadModule(filename, new()
+{
+    ReflectionImporterProvider = new CoreLibReflectionImporterProvider("netstandard, Version=2.1.0.0"),
+});
 
-var command = module.Types.Single(t => t.Name == "OracleCommand");
-var activitySource = AddActivitySource("Oracle.ManagedDataAccess.Client.OracleCommand", command, module);
+var oracleConfig = module.GetType("Oracle.ManagedDataAccess.Client.OracleConfiguration");
+var eventArgs = DeclareEventArgs();
+var onStart = DeclareEvent("ActivityStart");
+var onEnd = DeclareEvent("ActivityEnd");
+
+var command = module.GetType("Oracle.ManagedDataAccess.Client.OracleCommand");
 var execReader = command.Methods.Single(t => t.Name == "ExecuteReader" && t.IsAssembly);
-WrapWithActivity("ExecuteReader", execReader, activitySource, module);
+WrapWithActivity("ExecuteReader", execReader, false);
 var execNonQuery = command.Methods.Single(t => t.Name == "ExecuteNonQuery");
-WrapWithActivity("ExecuteNonQuery", execNonQuery, activitySource, module, "affected");
+WrapWithActivity("ExecuteNonQuery", execNonQuery, true);
 
-var reader = module.Types.Single(t => t.Name == "OracleDataReader");
-activitySource = AddActivitySource("Oracle.ManagedDataAccess.Client.OracleDataReader", reader, module);
-InstrumentReader(reader, activitySource, module);
+var reader = module.GetType("Oracle.ManagedDataAccess.Client.OracleDataReader");
+InstrumentReader(reader);
 
 filename = filename.Replace(".dll", ".APM.dll");
 module.Write(filename);
 Console.WriteLine("Assembly patched: " + filename);
 
-static FieldDefinition AddActivitySource(string sourceName, TypeDefinition t, ModuleDefinition mod)
+TypeDefinition DeclareEventArgs()
 {
-  // Declare field
-  // private static ActivitySource activitySource;
-  var activitySource = new FieldDefinition(
-    "activitySource",
-    FieldAttributes.Static | FieldAttributes.Private,
-    mod.ImportReference(typeof(ActivitySource)));
-  t.Fields.Add(activitySource);
+    var eventArgs = module.ImportReference(typeof(EventArgs));
+    var eventClass = new TypeDefinition(
+        "Oracle.ManagedDataAccess.Client",
+        "OracleActivityEventArgs",
+        TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.BeforeFieldInit,
+        eventArgs);
+    module.Types.Add(eventClass);
 
-  // Find static ctor for initialization
-  var cctor = t.GetStaticConstructor();
-  if (cctor == null)
-  {
-    cctor = new MethodDefinition(
-      ".cctor",
-      MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.RTSpecialName | MethodAttributes.SpecialName | MethodAttributes.HideBySig,
-      mod.TypeSystem.Void);
-    t.Methods.Add(cctor);
-    cctor.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
-  }
+    eventClass.Fields.Add(new("Activity", FieldAttributes.Public, module.TypeSystem.String));  // ExecuteReader | ExecuteNonQuery | Read
+    eventClass.Fields.Add(new("Rows", FieldAttributes.Public, module.TypeSystem.Int32));       // # affected rows on ExecuteNonQuery end; # read rows on Read End
+    eventClass.Fields.Add(new("Failed", FieldAttributes.Public, module.TypeSystem.Boolean));   // true if ExecuteReader or ExecuteNonQuery threw an exception
+    eventClass.Fields.Add(new("State", FieldAttributes.Public, module.TypeSystem.Object));     // Available to store state between Start and End events
 
-  // Init field
-  // activitySource = new ActivitySource("Oracle.ManagedDataAccess.Client.OracleCommand", version: "");
-  var activitySourceCtor = mod.ImportReference(typeof(ActivitySource).GetConstructor(new[] { typeof(string), typeof(string) }));
-  var il = cctor.Body.GetILProcessor();
-  il.Body.Instructions.Insert(0, il.Create(OpCodes.Ldstr, sourceName));
-  il.Body.Instructions.Insert(1, il.Create(OpCodes.Ldstr, ""));
-  il.Body.Instructions.Insert(2, il.Create(OpCodes.Newobj, activitySourceCtor));
-  il.Body.Instructions.Insert(3, il.Create(OpCodes.Stsfld, activitySource));
+    var ctor = new MethodDefinition(
+        ".ctor",
+        MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.RTSpecialName | MethodAttributes.SpecialName,
+        module.TypeSystem.Void);
+    eventClass.Methods.Add(ctor);
+    var il = ctor.Body.GetILProcessor();
+    il.Emit(OpCodes.Ldarg_0);
+    il.Emit(OpCodes.Call, module.ImportReference(typeof(EventArgs).GetConstructor(Array.Empty<Type>())));
+    il.Emit(OpCodes.Ret);
 
-  return activitySource;
+    return eventClass;
 }
 
-static void WrapWithActivity(string activityName, MethodDefinition method, FieldDefinition activitySource, ModuleDefinition mod, string? resultTag = null)
+MethodDefinition DeclareEvent(string name)
 {
-  var il = method.Body.GetILProcessor();
-
-  // Define variables:
-  //   Activity? activity;      // Activity that wraps this method
-  //   ReturnType result;       // Temp storage for method result when leaving .try block
-  var activity = new VariableDefinition(mod.ImportReference(typeof(Activity)));
-  il.Body.Variables.Add(activity);
-
-  var result = new VariableDefinition(method.ReturnType);
-  il.Body.Variables.Add(result);
-
-  // Create final instruction that can be jumped to by `leave` instructions
-  var endLabel = il.Create(OpCodes.Nop);
-
-  // Replace all `ret` instructions because they are forbidden inside a `try` block.
-  //   stloc result   // Put the return value aside (stack is emptied by leave)
-  //   leave endLabel // Leave the try block and jump to final instruction.
-  for (int i = 0; i < il.Body.Instructions.Count; i++)
-  {
-    if (il.Body.Instructions[i].OpCode == OpCodes.Ret)
+    var delegateType = module.ImportReference(typeof(EventHandler<>)).MakeGenericInstanceType(eventArgs);
+    var compareExchange = new GenericInstanceMethod(
+        module.ImportReference(typeof(Interlocked).GetMethods().Single(m => m.Name == "CompareExchange" && m.IsGenericMethod)))
     {
-      // Don't replace the `ret` instruction with a new one, mutate instead.
-      // This is important because `ret` might be the target of some jumps in original code.
-      il.Body.Instructions[i].OpCode = OpCodes.Stloc;
-      il.Body.Instructions[i].Operand = result;
-      il.Body.Instructions.Insert(++i, il.Create(OpCodes.Leave, endLabel));
+        GenericArguments = { delegateType }
+    };
+    var combine = module.ImportReference(typeof(Delegate).GetMethods().Single(m => m.Name == "Combine" && m.GetParameters().Length == 2));
+
+    var field = new FieldDefinition("m_" + name, FieldAttributes.Private | FieldAttributes.Static, module.ImportReference(delegateType));
+    oracleConfig.Fields.Add(field);
+
+    var add = new MethodDefinition(
+        "add_" + name,
+        MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.SpecialName | MethodAttributes.HideBySig,
+        module.TypeSystem.Void)
+    {
+        Parameters = { new("value", ParameterAttributes.None, module.ImportReference(delegateType)) },
+        Body = { Variables = { /* handler */ new(delegateType), /* beforeXchg */ new(delegateType), /* combined */ new(delegateType) } },
+    };
+    oracleConfig.Methods.Add(add);
+    var il = add.Body.GetILProcessor();
+    // var handler = OracleConfiguration.m_name
+    il.Emit(OpCodes.Ldsfld, field);
+    il.Emit(OpCodes.Stloc_0);
+    // do {
+    Instruction loop;
+    {
+        // beforeXchg = handler
+        il.Append(loop = il.Create(OpCodes.Ldloc_0));
+        il.Emit(OpCodes.Stloc_1);
+        // combined = (EventHandler<OracleActivityEventArgs>) Delegate.Combine(beforeXchg, value)
+        il.Emit(OpCodes.Ldloc_1);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Call, combine);
+        il.Emit(OpCodes.Castclass, delegateType);
+        il.Emit(OpCodes.Stloc_2);
+        // handler = Interlocked.CompareExchange(ref OracleConfiguration.m_name, combined, beforeXchg)
+        il.Emit(OpCodes.Ldsflda, field);
+        il.Emit(OpCodes.Ldloc_2);
+        il.Emit(OpCodes.Ldloc_1);
+        il.Emit(OpCodes.Call, compareExchange);
+        il.Emit(OpCodes.Stloc_0);
+        // } while (handler != beforeXchg)
+        il.Emit(OpCodes.Ldloc_0);
+        il.Emit(OpCodes.Ldloc_1);
+        il.Emit(OpCodes.Bne_Un_S, loop);
     }
-  }
+    il.Emit(OpCodes.Ret);
 
-  // Prepend activity initialisation
-  //   activity = activitySource
-  //      .CreateActivity(activityName, ActivityKind.Internal)
-  //      ?.SetTag("cmd", this)
-  //      .Start();
-  var store = il.Create(OpCodes.Stloc, activity);
-  il.Body.Instructions.Insert(0, il.Create(OpCodes.Ldsfld, activitySource));
-  il.Body.Instructions.Insert(1, il.Create(OpCodes.Ldstr, activityName));
-  il.Body.Instructions.Insert(2, il.Create(OpCodes.Ldc_I4_0)); // ActivityKind.Internal
-  il.Body.Instructions.Insert(3, il.Create(OpCodes.Call,
-    mod.ImportReference(typeof(ActivitySource).GetMethod("CreateActivity", new[] { typeof(string), typeof(ActivityKind) }))));
-  il.Body.Instructions.Insert(4, il.Create(OpCodes.Dup));
-  il.Body.Instructions.Insert(5, il.Create(OpCodes.Brfalse_S, store));
-  il.Body.Instructions.Insert(6, il.Create(OpCodes.Ldstr, "cmd"));
-  il.Body.Instructions.Insert(7, il.Create(OpCodes.Ldarg_0));
-  il.Body.Instructions.Insert(8, il.Create(OpCodes.Call,
-    mod.ImportReference(typeof(Activity).GetMethod("SetTag", new[] { typeof(string), typeof(object) }))));
-  il.Body.Instructions.Insert(9, il.Create(OpCodes.Call,
-    mod.ImportReference(typeof(Activity).GetMethod("Start"))));
-  il.Body.Instructions.Insert(10, store);
+    var remove = new MethodDefinition(
+        "remove_" + name,
+        MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.SpecialName | MethodAttributes.HideBySig,
+        module.TypeSystem.Void)
+    {
+        Parameters = { new("value", ParameterAttributes.None, delegateType) },
+        Body = { Variables = { /* handler */ new(delegateType), /* beforeXchg */ new(delegateType), /* removed */ new(delegateType) } },
+    };
+    oracleConfig.Methods.Add(remove);
+    il = remove.Body.GetILProcessor();
+    // handler = OracleConfiguration..m_name
+    il.Emit(OpCodes.Ldsfld, field);
+    il.Emit(OpCodes.Stloc_0);
+    // do {
+    {
+        // beforeXchg = handler
+        il.Append(loop = il.Create(OpCodes.Ldloc_0));
+        il.Emit(OpCodes.Stloc_1);
+        // removed = (EventHandler<OracleActivityEventArgs>) Delegate.Remove(beforeXchg, value)
+        il.Emit(OpCodes.Ldloc_1);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Call, module.ImportReference(typeof(Delegate).GetMethod("Remove")));
+        il.Emit(OpCodes.Castclass, delegateType);
+        il.Emit(OpCodes.Stloc_2);
+        // handler = Interlocked.CompareExchange(ref OracleConfiguration.m_name, removed, beforeXchg)
+        il.Emit(OpCodes.Ldsflda, field);
+        il.Emit(OpCodes.Ldloc_2);
+        il.Emit(OpCodes.Ldloc_1);
+        il.Emit(OpCodes.Call, compareExchange);
+        il.Emit(OpCodes.Stloc_0);
+        // } while (handler != beforeXchg)
+        il.Emit(OpCodes.Ldloc_0);
+        il.Emit(OpCodes.Ldloc_1);
+        il.Emit(OpCodes.Bne_Un_S, loop);
+    }
+    il.Emit(OpCodes.Ret);
 
-  // Append fault block to handle errors
-  // .fault
-  // {
-  //     activity
-  //       ?.SetTag("otel.status_code", "ERROR")
-  //        .Dispose();
-  // }
-  var endFault = il.Create(OpCodes.Endfinally); // Endfault and Endfinally are the same opcode
-  var faultBlock = il.Create(OpCodes.Ldloc, activity);
-  il.Append(faultBlock);
-  il.Emit(OpCodes.Brfalse_S, endFault);
-  il.Emit(OpCodes.Ldloc, activity);
-  il.Emit(OpCodes.Ldstr, "otel.status_code");
-  il.Emit(OpCodes.Ldstr, "ERROR");
-  il.Emit(OpCodes.Call,
-    mod.ImportReference(typeof(Activity).GetMethod("SetTag", new[] { typeof(string), typeof(object) })));
-  il.Emit(OpCodes.Callvirt,
-    mod.ImportReference(typeof(Activity).GetMethod("Dispose")));
-  il.Append(endFault);
+    var eventDef = new EventDefinition(name, EventAttributes.None, delegateType)
+    {
+        AddMethod = add,
+        RemoveMethod = remove,
+    };
+    oracleConfig.Events.Add(eventDef);
 
-  // Complete activity and return set aside result from wrapped code
-  il.Append(endLabel);
-  var retLabel = il.Create(OpCodes.Nop);
-  //   activity?.SetTag(resultTag, result)
-  il.Emit(OpCodes.Ldloc, activity);
-  il.Emit(OpCodes.Brfalse_S, retLabel);
-  il.Emit(OpCodes.Ldloc, activity);
-  if (resultTag != null)
-  {
-    il.Emit(OpCodes.Ldstr, resultTag);
+    var raise = new MethodDefinition(
+        "On" + name,
+        MethodAttributes.Assembly | MethodAttributes.Static,
+        module.TypeSystem.Void)
+    {
+        Parameters =
+        {
+            new("sender", ParameterAttributes.None, module.TypeSystem.Object),
+            new("args", ParameterAttributes.None, eventArgs),
+        },
+    };
+    oracleConfig.Methods.Add(raise);
+    il = raise.Body.GetILProcessor();
+    // if m_name != null
+    il.Emit(OpCodes.Ldsfld, field);
+    il.Emit(OpCodes.Dup);
+    var jump = il.Create(OpCodes.Nop);
+    il.Emit(OpCodes.Brtrue_S, jump);
+    il.Emit(OpCodes.Pop);
+    il.Emit(OpCodes.Ret);
+    // m_name.Invoke(sender, args)
+    il.Append(jump);
+    il.Emit(OpCodes.Ldarg_0);
+    il.Emit(OpCodes.Ldarg_1);
+    il.Emit(OpCodes.Call, new MethodReference("Invoke", module.TypeSystem.Void, delegateType)
+    {
+        HasThis = true,
+        Parameters =
+        {
+            new("sender", ParameterAttributes.None, module.TypeSystem.Object),
+            new("args", ParameterAttributes.None, delegateType.ElementType.GenericParameters[0]),
+        },
+    });
+    il.Emit(OpCodes.Ret);
+
+    return raise;
+}
+
+void WrapWithActivity(string activityName, MethodDefinition method, bool setRows)
+{
+    var il = method.Body.GetILProcessor();
+
+    // Define variables:
+    //   OracleActivityEventArgs args;    // Event args for this call (only one -> shared State between start and end)
+    //   ReturnType result;               // Temp storage for method result when leaving .try block
+    var args = new VariableDefinition(eventArgs);
+    il.Body.Variables.Add(args);
+
+    var result = new VariableDefinition(method.ReturnType);
+    il.Body.Variables.Add(result);
+
+    // Create final instruction that can be jumped to by `leave` instructions
+    var endLabel = il.Create(OpCodes.Nop);
+
+    // Replace all `ret` instructions because they are forbidden inside a `try` block.
+    //   stloc result   // Put the return value aside (stack is emptied by leave)
+    //   leave endLabel // Leave the try block and jump to final instruction.
+    for (int i = 0; i < il.Body.Instructions.Count; i++)
+    {
+        if (il.Body.Instructions[i].OpCode == OpCodes.Ret)
+        {
+            // Don't replace the `ret` instruction with a new one, mutate instead.
+            // This is important because `ret` might be the target of some jumps in original code.
+            il.Body.Instructions[i].OpCode = OpCodes.Stloc;
+            il.Body.Instructions[i].Operand = result;
+            il.Body.Instructions.Insert(++i, il.Create(OpCodes.Leave, endLabel));
+        }
+    }
+
+    // Prepend:
+    int j = 0;
+    var instr = il.Body.Instructions;
+    // args = new OracleActivityEventArgs { Activity = activityName };
+    instr.Insert(j++, il.Create(OpCodes.Newobj, eventArgs.GetConstructors().Single()));
+    instr.Insert(j++, il.Create(OpCodes.Dup));
+    instr.Insert(j++, il.Create(OpCodes.Ldstr, activityName));
+    instr.Insert(j++, il.Create(OpCodes.Stfld, eventArgs.Fields.Single(x => x.Name == "Activity")));
+    instr.Insert(j++, il.Create(OpCodes.Stloc, args));
+    // OracleConfiguration.OnActivityStart(this, args)
+    Instruction tryStart;
+    instr.Insert(j++, tryStart = il.Create(OpCodes.Ldarg_0));
+    instr.Insert(j++, il.Create(OpCodes.Ldloc, args));
+    instr.Insert(j++, il.Create(OpCodes.Call, onStart));
+
+    // Append fault block to handle errors
+    // .fault
+    // {
+    //     args.Failed = true;
+    //     OracleConfiguration.OnActivityEnd(this, args);
+    // }
+    var faultBlock = il.Create(OpCodes.Ldloc, args);
+    il.Append(faultBlock);
+    il.Emit(OpCodes.Ldc_I4_1);
+    il.Emit(OpCodes.Stfld, eventArgs.Fields.Single(x => x.Name == "Failed"));
+    il.Emit(OpCodes.Ldarg_0);
+    il.Emit(OpCodes.Ldloc, args);
+    il.Emit(OpCodes.Call, onEnd);
+    il.Emit(OpCodes.Endfinally); // Endfault and Endfinally are the same opcode
+
+    // Complete activity and return set aside result from wrapped code
+    il.Append(endLabel);
+    var retLabel = il.Create(OpCodes.Nop);
+    //  args.Rows = result;
+    if (setRows)
+    {
+        il.Emit(OpCodes.Ldloc, args);
+        il.Emit(OpCodes.Ldloc, result);
+        il.Emit(OpCodes.Stfld, eventArgs.Fields.Single(x => x.Name == "Rows"));
+    }
+    //   OracleConfiguration.OnActivityEnd(this, args);
+    il.Emit(OpCodes.Ldarg_0);
+    il.Emit(OpCodes.Ldloc, args);
+    il.Emit(OpCodes.Call, onEnd);
+    //   return result;
+    il.Append(retLabel);
     il.Emit(OpCodes.Ldloc, result);
-    if (result.VariableType.IsValueType)
-      il.Emit(OpCodes.Box, result.VariableType);
-    il.Emit(OpCodes.Call,
-      mod.ImportReference(typeof(Activity).GetMethod("SetTag", new[] { typeof(string), typeof(object) })));
-  }
-  //   activity?.Dispose();
-  il.Emit(OpCodes.Callvirt,
-    mod.ImportReference(typeof(Activity).GetMethod("Dispose")));
-  //   return result;
-  il.Append(retLabel);
-  il.Emit(OpCodes.Ldloc, result);
-  il.Emit(OpCodes.Ret);
+    il.Emit(OpCodes.Ret);
 
-  var handler = new ExceptionHandler(ExceptionHandlerType.Fault)
-  {
-    TryStart = il.Body.Instructions[0],
-    TryEnd = faultBlock,
-    HandlerStart = faultBlock,
-    HandlerEnd = endLabel,
-  };
-  il.Body.ExceptionHandlers.Add(handler);
+    var handler = new ExceptionHandler(ExceptionHandlerType.Fault)
+    {
+        TryStart = tryStart,
+        TryEnd = faultBlock,
+        HandlerStart = faultBlock,
+        HandlerEnd = endLabel,
+    };
+    il.Body.ExceptionHandlers.Add(handler);
 }
 
-static void InstrumentReader(TypeDefinition t, FieldReference activitySource, ModuleDefinition mod)
+void InstrumentReader(TypeDefinition t)
 {
-  // Create fields for activity and count
-  var activity = new FieldDefinition("activity", FieldAttributes.Private, mod.ImportReference(typeof(Activity)));
-  t.Fields.Add(activity);
+    // Create fields for event activityArgs and count
+    var args = new FieldDefinition("activityArgs", FieldAttributes.Private, eventArgs);
+    t.Fields.Add(args);
 
-  var rowCount = new FieldDefinition("rowCount", FieldAttributes.Private, mod.TypeSystem.Int32);
-  t.Fields.Add(rowCount);
+    var rowCount = new FieldDefinition("rowCount", FieldAttributes.Private, module.TypeSystem.Int32);
+    t.Fields.Add(rowCount);
 
-  // ----------------------------------------
-  // Instantiate activity in ctor
-  // ----------------------------------------
-  var ctor = t.GetConstructors().Single(c => !c.IsStatic);
-  // Find the single `ret` instruction (if there's only one, it has to be the last instruction) and insert
-  //   activity = activitySource.StartActivity("FetchData", ActivityKind.Internal);
-  var il = ctor.Body.GetILProcessor();
-  var ret = ctor.Body.Instructions.Single(i => i.OpCode == OpCodes.Ret);
-  ret.OpCode = OpCodes.Ldarg_0;
-  il.Emit(OpCodes.Ldsfld, activitySource);
-  il.Emit(OpCodes.Ldstr, "FetchData");
-  il.Emit(OpCodes.Ldc_I4_0);  // ActivityKind.Internal
-  il.Emit(OpCodes.Call,
-    mod.ImportReference(typeof(ActivitySource).GetMethod("StartActivity", new[] { typeof(string), typeof(ActivityKind) })));
-  il.Emit(OpCodes.Stfld, activity);
-  il.Emit(OpCodes.Ret);
-
-  // ----------------------------------------
-  // Complete activity in Close()
-  // ----------------------------------------
-  var dispose = t.GetMethods().Single(m => m.Name == "Close");
-  il = dispose.Body.GetILProcessor();
-  int i = 0;
-  //   activity?.SetTag("rows", rowCount).Dispose()
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldarg_0));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldfld, activity));
-  il.Body.Instructions.Insert(i, il.Create(OpCodes.Brfalse_S, il.Body.Instructions[i++]));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldarg_0));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldfld, activity));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldstr, "rows"));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldarg_0));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldfld, rowCount));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Box, rowCount.FieldType));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Call,
-    mod.ImportReference(typeof(Activity).GetMethod("SetTag", new[] { typeof(string), typeof(object) }))));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Callvirt,
-    mod.ImportReference(typeof(Activity).GetMethod("Dispose"))));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldarg_0));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Ldnull));
-  il.Body.Instructions.Insert(i++, il.Create(OpCodes.Stfld, activity));
-
-  // ----------------------------------------
-  // Increment rowCount in .Read() calls
-  // ----------------------------------------
-  var read = t.GetMethods().Single(m => m.Name == "Read");
-  il = read.Body.GetILProcessor();
-  var instr = read.Body.Instructions;
-  for (i = 0; i < instr.Count; i++)
-  {
-    if (instr[i].OpCode == OpCodes.Ret)
+    // ----------------------------------------
+    // Start activity on 1st Read() call
+    // ----------------------------------------
+    var read = t.GetMethods().Single(m => m.Name == "Read");
+    var il = read.Body.GetILProcessor();
+    var instr = il.Body.Instructions;
+    int i = 0;
+    // if activityArgs == null
+    instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+    instr.Insert(i++, il.Create(OpCodes.Ldfld, args));
+    instr.Insert(i, il.Create(OpCodes.Brtrue_S, instr[i++]));
     {
-      // return false
-      if (instr[i - 1].OpCode == OpCodes.Ldc_I4_0) continue;
-      if (instr[i - 1].OpCode != OpCodes.Ldc_I4_1)
-      {
-        // Dynamic case, not `return true`. Let's make a quick check.
+        // activityArgs = new OracleActivityEventArgs { Activity = "Read" };
+        instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+        instr.Insert(i++, il.Create(OpCodes.Newobj, eventArgs.GetConstructors().Single()));
         instr.Insert(i++, il.Create(OpCodes.Dup));
-        instr.Insert(i, il.Create(OpCodes.Brfalse_S, instr[i++]));
-      }
-      // rowCount++;
-      instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
-      instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
-      instr.Insert(i++, il.Create(OpCodes.Ldfld, rowCount));
-      instr.Insert(i++, il.Create(OpCodes.Ldc_I4_1));
-      instr.Insert(i++, il.Create(OpCodes.Add));
-      instr.Insert(i++, il.Create(OpCodes.Stfld, rowCount));
+        instr.Insert(i++, il.Create(OpCodes.Ldstr, "Read"));
+        instr.Insert(i++, il.Create(OpCodes.Stfld, eventArgs.Fields.Single(x => x.Name == "Activity")));
+        instr.Insert(i++, il.Create(OpCodes.Stfld, args));
+        // OracleConfiguration.OnActivityStart(this, activityArgs);
+        instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+        instr.Insert(i++, il.Create(OpCodes.Dup));
+        instr.Insert(i++, il.Create(OpCodes.Ldfld, args));
+        instr.Insert(i++, il.Create(OpCodes.Call, onStart));
     }
-  }
+
+    // ----------------------------------------
+    // Increment rowCount in .Read() calls
+    // ----------------------------------------
+    for (; i < instr.Count; ++i)
+    {
+        if (instr[i].OpCode == OpCodes.Ret)
+        {
+            // return false
+            if (instr[i - 1].OpCode == OpCodes.Ldc_I4_0) continue;
+            if (instr[i - 1].OpCode != OpCodes.Ldc_I4_1)
+            {
+                // Dynamic case, not `return true`. Let's make a quick check.
+                instr.Insert(i++, il.Create(OpCodes.Dup));
+                instr.Insert(i, il.Create(OpCodes.Brfalse_S, instr[i++]));
+            }
+            // rowCount++;
+            instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+            instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+            instr.Insert(i++, il.Create(OpCodes.Ldfld, rowCount));
+            instr.Insert(i++, il.Create(OpCodes.Ldc_I4_1));
+            instr.Insert(i++, il.Create(OpCodes.Add));
+            instr.Insert(i++, il.Create(OpCodes.Stfld, rowCount));
+        }
+    }
+
+    // ----------------------------------------
+    // Complete activity in Close()
+    // ----------------------------------------
+    var close = t.GetMethods().Single(m => m.Name == "Close");
+    il = close.Body.GetILProcessor();
+    instr = il.Body.Instructions;
+    i = 0;
+    // if activityArgs != null
+    instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+    instr.Insert(i++, il.Create(OpCodes.Ldfld, args));
+    instr.Insert(i, il.Create(OpCodes.Brfalse_S, instr[i++]));
+    {
+        //   activityArgs.Rows = rowCount;
+        instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+        instr.Insert(i++, il.Create(OpCodes.Ldfld, args));
+        instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+        instr.Insert(i++, il.Create(OpCodes.Ldfld, rowCount));
+        instr.Insert(i++, il.Create(OpCodes.Stfld, eventArgs.Fields.Single(x => x.Name == "Rows")));
+        //   OracleConfiguration.OnActivityEnd(this, activityArgs);
+        instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+        instr.Insert(i++, il.Create(OpCodes.Dup));
+        instr.Insert(i++, il.Create(OpCodes.Ldfld, args));
+        instr.Insert(i++, il.Create(OpCodes.Call, onEnd));
+        // activityArgs = null;
+        instr.Insert(i++, il.Create(OpCodes.Ldarg_0));
+        instr.Insert(i++, il.Create(OpCodes.Ldnull));
+        instr.Insert(i++, il.Create(OpCodes.Stfld, args));
+    }
 }
