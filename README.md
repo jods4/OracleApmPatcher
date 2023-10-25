@@ -1,5 +1,5 @@
 # OracleApmPatcher
-This tool uses Mono Cecil to instrument `Oracle.ManagedDataAccess.dll` with activity events similar to `ActvitiySource`.
+This tool uses Mono Cecil to instrument `Oracle.ManagedDataAccess.dll` with activity events similar to `ActvitySource`.
 
 > [!NOTE]
 > Earlier code that created a real `ActivitySource` is available on branch [activity-source](https://github.com/jods4/OracleApmPatcher/tree/activity-source).
