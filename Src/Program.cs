@@ -21,8 +21,10 @@ var eventArgs = DeclareEventArgs();
 var onStart = DeclareEvent("ActivityStart");
 var onEnd = DeclareEvent("ActivityEnd");
 
+// Note that recente ODP.NET releases have true async support, which isn't instrumented here.
+
 var command = module.GetType("Oracle.ManagedDataAccess.Client.OracleCommand");
-var execReader = command.Methods.Single(t => t.Name == "ExecuteReader" && t.IsAssembly);
+var execReader = command.Methods.Single(t => t.Name == "ExecuteReaderInternal");
 WrapWithActivity("ExecuteReader", execReader, false);
 var execNonQuery = command.Methods.Single(t => t.Name == "ExecuteNonQuery");
 WrapWithActivity("ExecuteNonQuery", execNonQuery, true);

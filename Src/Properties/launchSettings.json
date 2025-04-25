@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "OraclePatcher": {
+      "commandName": "Project",
+      "commandLineArgs": "c:\\Users\\JDS\\Downloads\\Oracle.ManagedDataAccess.dll"
+    }
+  }
+}
